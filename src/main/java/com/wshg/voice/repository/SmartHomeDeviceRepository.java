@@ -12,5 +12,7 @@ public interface SmartHomeDeviceRepository extends JpaRepository<SmartHomeDevice
 
     List<SmartHomeDevice> findByEnabledTrue();
 
+    List<SmartHomeDevice> findByRoom(String room);
+
     Optional<SmartHomeDevice> findByDeviceId(String deviceId);
 }

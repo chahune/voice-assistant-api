@@ -26,7 +26,15 @@ public class DeviceController {
     private final VectorStoreService vectorStoreService;
 
     @GetMapping("/list")
-    public List<SmartHomeDevice> list(@RequestParam(required = false) String room) {
+    public List<SmartHomeDevice> list(
+            @RequestParam(required = false) String room,
+            @RequestParam(required = false, defaultValue = "false") boolean all) {
+        if (Boolean.TRUE.equals(all)) {
+            if (room != null && !room.isBlank()) {
+                return deviceRepository.findByRoom(room);
+            }
+            return deviceRepository.findAll();
+        }
         if (room != null && !room.isBlank()) {
             return deviceRepository.findByRoomAndEnabledTrue(room);
         }
