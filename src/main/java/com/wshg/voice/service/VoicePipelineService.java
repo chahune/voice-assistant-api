@@ -15,6 +15,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
 import org.springframework.web.multipart.MultipartFile;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
@@ -39,6 +40,7 @@ public class VoicePipelineService {
     private final RestTemplate restTemplate;
     private final VectorStoreService vectorStoreService;
     private final DeviceControlService deviceControlService;
+    private final ChatHistoryService chatHistoryService;
 
     /**
      * 执行完整管道，返回识别文字、回复文字、TTS 文件名（不含路径，用于拼 audioUrl）。
@@ -79,6 +81,8 @@ public class VoicePipelineService {
             String reply;
             String ttsFileName = prefix + ".wav";
             Path ttsPath = ttsDir.resolve(ttsFileName);
+
+            String ragContext = null;
 
             if (props.isLocal()) {
                 // 本地：PaddleSpeech(ASR + TTS) → vLLM
@@ -133,6 +137,21 @@ public class VoicePipelineService {
 
             String audioUrl = (audioBaseUrl.endsWith("/") ? audioBaseUrl : audioBaseUrl + "/") + "tts/" + ttsFileName;
             log.info("[管道] 处理完成, userText={}, replyLength={}, audioUrl={}", userText, reply != null ? reply.length() : 0, audioUrl);
+
+            // 记录聊天到数据库与向量库
+            try {
+                boolean ragUsed = props.isRagEnabled();
+                String answerSource = ragUsed ? "RAG-知识库" : "LLM";
+                chatHistoryService.logChat(
+                        userText,
+                        reply,
+                        props.isLocal() ? "voice-local" : "voice-online",
+                        answerSource,
+                        ragContext
+                );
+            } catch (Exception e) {
+                log.warn("[管道] 写入聊天记录失败", e);
+            }
             return VoiceUploadResponse.builder()
                     .text(userText)
                     .reply(reply)
@@ -268,42 +287,18 @@ public class VoicePipelineService {
     }
 
     private boolean runTtsOnline(String text, String apiKey, Path outWavPath) {
-        if (text == null || text.isBlank() || apiKey == null || apiKey.isBlank()) return false;
-        String ttsUrl = "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation";
-        Map<String, Object> input = Map.of(
-                "text", text.length() > 500 ? text.substring(0, 500) : text,
-                "voice", "Cherry",
-                "language_type", "Chinese"
-        );
-        Map<String, Object> body = Map.of("model", "qwen3-tts-flash", "input", input);
-        HttpHeaders headers = new HttpHeaders();
-        headers.setContentType(MediaType.APPLICATION_JSON);
-        headers.setBearerAuth(apiKey);
-        HttpEntity<Map<String, Object>> entity = new HttpEntity<>(body, headers);
         try {
-            ResponseEntity<QwenTtsResponse> res = restTemplate.postForEntity(ttsUrl, entity, QwenTtsResponse.class);
-            if (!res.getStatusCode().is2xxSuccessful() || res.getBody() == null) return false;
-            QwenTtsResponse bodyObj = res.getBody();
-            String data = bodyObj.getAudioData();
-            String url = bodyObj.getAudioUrl();
-            byte[] audioBytes = null;
-            if (data != null && !data.isBlank()) {
-                audioBytes = Base64.getDecoder().decode(data);
-            } else if (url != null && !url.isBlank()) {
-                ResponseEntity<byte[]> fileRes = restTemplate.getForEntity(URI.create(url), byte[].class);
-                if (fileRes.getStatusCode().is2xxSuccessful() && fileRes.getBody() != null) {
-                    audioBytes = fileRes.getBody();
-                }
+            byte[] merged = synthesizeOnlineToBytes(text, apiKey);
+            if (merged == null || merged.length == 0) {
+                return false;
             }
-            if (audioBytes != null && audioBytes.length > 0) {
-                Files.createDirectories(outWavPath.getParent());
-                Files.write(outWavPath, audioBytes);
-                return true;
-            }
+            Files.createDirectories(outWavPath.getParent());
+            Files.write(outWavPath, merged);
+            return true;
         } catch (Exception e) {
             log.warn("线上 TTS 异常", e);
+            return false;
         }
-        return false;
     }
 
     /** 打印最终发送给大模型的消息（system + user），便于排查 */
@@ -425,6 +420,113 @@ public class VoicePipelineService {
             log.warn("TTS 执行异常", e);
             return false;
         }
+    }
+
+    /**
+     * 多段在线 TTS：将长文本按 TTS_MAX_INPUT_LENGTH 分段，多次调用千问 TTS，并将多个 WAV 片段合并为一个完整 WAV。
+     */
+    private byte[] synthesizeOnlineToBytes(String text, String apiKey) {
+        if (text == null || text.isBlank() || apiKey == null || apiKey.isBlank()) {
+            return null;
+        }
+        int segmentLen = TTS_MAX_INPUT_LENGTH;
+        java.util.List<byte[]> segments = new java.util.ArrayList<>();
+        int offset = 0;
+        while (offset < text.length()) {
+            int end = Math.min(offset + segmentLen, text.length());
+            String segText = text.substring(offset, end);
+            byte[] wav = callQwenTtsOnce(segText, apiKey);
+            if (wav != null && wav.length > 0) {
+                segments.add(wav);
+            }
+            offset = end;
+        }
+        if (segments.isEmpty()) {
+            return null;
+        }
+        return mergeWavSegments(segments);
+    }
+
+    /**
+     * 调用千问 TTS 生成单段 WAV（完整文件，包含 RIFF 头）。
+     */
+    private byte[] callQwenTtsOnce(String text, String apiKey) {
+        if (text == null || text.isBlank() || apiKey == null || apiKey.isBlank()) {
+            return null;
+        }
+        String ttsUrl = "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation";
+        Map<String, Object> input = Map.of(
+                "text", text,
+                "voice", "Cherry",
+                "language_type", "Chinese"
+        );
+        Map<String, Object> body = Map.of("model", "qwen3-tts-flash", "input", input);
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        headers.setBearerAuth(apiKey);
+        HttpEntity<Map<String, Object>> entity = new HttpEntity<>(body, headers);
+        try {
+            ResponseEntity<QwenTtsResponse> res = restTemplate.postForEntity(ttsUrl, entity, QwenTtsResponse.class);
+            if (!res.getStatusCode().is2xxSuccessful() || res.getBody() == null) {
+                return null;
+            }
+            QwenTtsResponse bodyObj = res.getBody();
+            String data = bodyObj.getAudioData();
+            String url = bodyObj.getAudioUrl();
+            byte[] audioBytes = null;
+            if (data != null && !data.isBlank()) {
+                audioBytes = Base64.getDecoder().decode(data);
+            } else if (url != null && !url.isBlank()) {
+                ResponseEntity<byte[]> fileRes = restTemplate.getForEntity(URI.create(url), byte[].class);
+                if (fileRes.getStatusCode().is2xxSuccessful() && fileRes.getBody() != null) {
+                    audioBytes = fileRes.getBody();
+                }
+            }
+            return (audioBytes != null && audioBytes.length > 0) ? audioBytes : null;
+        } catch (Exception e) {
+            log.warn("线上 TTS 单段调用异常", e);
+            return null;
+        }
+    }
+
+    /**
+     * 合并多个 WAV 片段：保留第一段头部，后续段去掉 44 字节头部，仅拼接数据，并重写 RIFF 头中的长度字段。
+     */
+    private byte[] mergeWavSegments(java.util.List<byte[]> segments) {
+        if (segments == null || segments.isEmpty()) {
+            return null;
+        }
+        byte[] first = segments.get(0);
+        if (first.length <= 44) {
+            return first;
+        }
+        try (ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+            // 写入第一段头部 + 数据
+            out.write(first, 0, 44);
+            out.write(first, 44, first.length - 44);
+            // 追加后续段的数据（跳过各自的头部）
+            for (int i = 1; i < segments.size(); i++) {
+                byte[] seg = segments.get(i);
+                if (seg == null || seg.length <= 44) continue;
+                out.write(seg, 44, seg.length - 44);
+            }
+            byte[] merged = out.toByteArray();
+            int fileSizeMinus8 = merged.length - 8;
+            int dataSize = merged.length - 44;
+            writeLittleEndianInt(merged, 4, fileSizeMinus8);
+            writeLittleEndianInt(merged, 40, dataSize);
+            return merged;
+        } catch (IOException e) {
+            log.warn("合并 TTS WAV 片段失败", e);
+            return first;
+        }
+    }
+
+    private static void writeLittleEndianInt(byte[] buf, int offset, int value) {
+        buf[offset] = (byte) (value & 0xFF);
+        buf[offset + 1] = (byte) ((value >> 8) & 0xFF);
+        buf[offset + 2] = (byte) ((value >> 16) & 0xFF);
+        buf[offset + 3] = (byte) ((value >> 24) & 0xFF);
     }
 
     private static void safeDelete(Path path) {
