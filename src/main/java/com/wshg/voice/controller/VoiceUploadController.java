@@ -7,6 +7,7 @@ import com.wshg.voice.dto.VoiceUploadResponse;
 import com.wshg.voice.dto.QwenTtsResponse;
 import com.wshg.voice.service.VoicePipelineService;
 import com.wshg.voice.service.VectorStoreService;
+import com.wshg.voice.service.ChatHistoryService;
 import jakarta.servlet.http.HttpServletRequest;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -40,6 +41,7 @@ public class VoiceUploadController {
     private final VoiceProperties voiceProperties;
     private final RestTemplate restTemplate;
     private final VectorStoreService vectorStoreService;
+    private final ChatHistoryService chatHistoryService;
 
     /** 健康检查，确认服务已启动 */
     @GetMapping("/health")
@@ -128,8 +130,9 @@ public class VoiceUploadController {
 
         // RAG：检索向量库，将相关文档拼入 system prompt
         String systemContent = "You are a helpful assistant.";
+        String context = null;
         if (voiceProperties.isRagEnabled()) {
-            String context = vectorStoreService.buildRagContext(text, voiceProperties.getRagTopK());
+            context = vectorStoreService.buildRagContext(text, voiceProperties.getRagTopK());
             if (context != null && !context.isBlank()) {
                 systemContent = "参考以下知识库内容回答用户问题。如知识库无相关内容，可凭自身知识回答。\n\n【知识库】\n" + context;
             }
@@ -181,43 +184,66 @@ public class VoiceUploadController {
 
         // 2. 调用千问 TTS，将文本转为音频（阿里云 Base64 或云端 URL）
         TtsResult ttsResult = callQwenTts(replyText, apiKey);
-        if (ttsResult == null || (isBlank(ttsResult.base64) && isBlank(ttsResult.url))) {
-            return ResponseEntity.status(502).body(Map.of("error", "千问 TTS 接口未返回音频数据"));
-        }
 
         // 3. 将云端音频「落地」到本地 tts 目录，并暴露为 /tts/xxx.wav（与 PaddleSpeech 情况保持一致）
         String serviceBaseUrl = buildBaseUrl(request);
-        String localFileName = "qwen_" + System.currentTimeMillis() + "_" +
-                UUID.randomUUID().toString().substring(0, 8) + ".wav";
-        Path ttsDir = voiceProperties.getTtsDirPath();
-        Path ttsPath = ttsDir.resolve(localFileName);
-        try {
-            Files.createDirectories(ttsDir);
-            byte[] audioBytes = null;
-            if (!isBlank(ttsResult.base64)) {
-                audioBytes = Base64.getDecoder().decode(ttsResult.base64);
-            } else if (!isBlank(ttsResult.url)) {
-                // 使用 URI 避免 RestTemplate 对已签名 URL 再次编码，导致 SignatureDoesNotMatch
-                ResponseEntity<byte[]> fileRes = restTemplate.getForEntity(URI.create(ttsResult.url), byte[].class);
-                if (fileRes.getStatusCode().is2xxSuccessful() && fileRes.getBody() != null) {
-                    audioBytes = fileRes.getBody();
+        String localAudioUrl = null;
+        if (ttsResult != null && (!isBlank(ttsResult.base64) || !isBlank(ttsResult.url))) {
+            String localFileName = "qwen_" + System.currentTimeMillis() + "_" +
+                    UUID.randomUUID().toString().substring(0, 8) + ".wav";
+            Path ttsDir = voiceProperties.getTtsDirPath();
+            Path ttsPath = ttsDir.resolve(localFileName);
+            try {
+                Files.createDirectories(ttsDir);
+                byte[] audioBytes = null;
+                if (!isBlank(ttsResult.base64)) {
+                    audioBytes = Base64.getDecoder().decode(ttsResult.base64);
+                } else if (!isBlank(ttsResult.url)) {
+                    // 使用 URI 避免 RestTemplate 对已签名 URL 再次编码，导致 SignatureDoesNotMatch
+                    ResponseEntity<byte[]> fileRes = restTemplate.getForEntity(URI.create(ttsResult.url), byte[].class);
+                    if (fileRes.getStatusCode().is2xxSuccessful() && fileRes.getBody() != null) {
+                        audioBytes = fileRes.getBody();
+                    }
                 }
+                if (audioBytes != null && audioBytes.length > 0) {
+                    Files.write(ttsPath, audioBytes);
+                    localAudioUrl = (serviceBaseUrl.endsWith("/") ? serviceBaseUrl : serviceBaseUrl + "/") + "tts/" + localFileName;
+                } else {
+                    log.warn("[API] /qwen 千问 TTS 未返回有效音频数据，仅返回文本");
+                }
+            } catch (IOException e) {
+                log.warn("[API] /qwen 保存本地 TTS 文件失败，仅返回文本", e);
             }
-            if (audioBytes == null || audioBytes.length == 0) {
-                return ResponseEntity.status(502).body(Map.of("error", "从千问 TTS 获取音频数据失败"));
-            }
-            Files.write(ttsPath, audioBytes);
-        } catch (IOException e) {
-            return ResponseEntity.status(502).body(Map.of("error", "保存本地 TTS 文件失败: " + e.getMessage()));
+        } else {
+            log.warn("[API] /qwen 千问 TTS 接口未返回音频数据，仅返回文本");
         }
 
-        String localAudioUrl = (serviceBaseUrl.endsWith("/") ? serviceBaseUrl : serviceBaseUrl + "/") + "tts/" + localFileName;
+        // 记录聊天到数据库与向量库
+        try {
+            boolean ragUsed = voiceProperties.isRagEnabled();
+            String answerSource = ragUsed ? "RAG-知识库" : "LLM";
+            chatHistoryService.logChat(
+                    text,
+                    replyText,
+                    "qwen-text",
+                    answerSource,
+                    context
+            );
+        } catch (Exception e) {
+            log.warn("[API] /qwen 写入聊天记录失败", e);
+        }
 
-        // 返回文本 + 本地音频 URL（ESP32 只需要访问 /tts/xxx.wav 即可）
-        return ResponseEntity.ok(Map.of(
-                "text", replyText,
-                "audioUrl", localAudioUrl
-        ));
+        // 返回文本 + 本地音频 URL（如 TTS 失败则 audioUrl 可能为空）
+        if (localAudioUrl != null) {
+            return ResponseEntity.ok(Map.of(
+                    "text", replyText,
+                    "audioUrl", localAudioUrl
+            ));
+        } else {
+            return ResponseEntity.ok(Map.of(
+                    "text", replyText
+            ));
+        }
     }
 
     /**
@@ -266,7 +292,10 @@ public class VoiceUploadController {
         if (isBlank(text) || isBlank(apiKey)) {
             return null;
         }
-
+        // 为避免超过千问 TTS 的长度限制，这里做一次保守截断（约 300 字作为语音预览）
+        if (text.length() > 500) {
+            text = text.substring(0, 500);
+        }
         String ttsUrl = "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation";
 
         // 按官方 curl 示例构造 input
