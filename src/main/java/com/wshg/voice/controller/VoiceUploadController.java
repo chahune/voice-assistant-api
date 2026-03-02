@@ -8,6 +8,8 @@ import com.wshg.voice.dto.QwenTtsResponse;
 import com.wshg.voice.service.VoicePipelineService;
 import com.wshg.voice.service.VectorStoreService;
 import com.wshg.voice.service.ChatHistoryService;
+import com.wshg.voice.service.NmcWeatherService;
+import com.wshg.voice.service.SinaStockService;
 import jakarta.servlet.http.HttpServletRequest;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -42,6 +44,8 @@ public class VoiceUploadController {
     private final RestTemplate restTemplate;
     private final VectorStoreService vectorStoreService;
     private final ChatHistoryService chatHistoryService;
+    private final NmcWeatherService nmcWeatherService;
+    private final SinaStockService sinaStockService;
 
     /** 健康检查，确认服务已启动 */
     @GetMapping("/health")
@@ -128,15 +132,28 @@ public class VoiceUploadController {
             return ResponseEntity.badRequest().body(Map.of("error", "text 不能为空"));
         }
 
-        // RAG：检索向量库，将相关文档拼入 system prompt
-        String systemContent = "You are a helpful assistant.";
+        // 天气 + RAG
+        StringBuilder systemParts = new StringBuilder();
+        if (voiceProperties.isWeatherEnabled() && nmcWeatherService.isWeatherQuery(text)) {
+            String weatherText = nmcWeatherService.fetchWeatherForQuery(text);
+            if (weatherText != null && !weatherText.isBlank()) {
+                systemParts.append("【实时天气】（来源：中央气象台 nmc.cn）\n").append(weatherText).append("\n\n");
+            }
+        }
+        if (voiceProperties.isStockEnabled() && sinaStockService.isStockQuery(text)) {
+            String stockText = sinaStockService.fetchStockForQuery(text);
+            if (stockText != null && !stockText.isBlank()) {
+                systemParts.append("【实时行情】（来源：新浪财经）\n").append(stockText).append("\n\n");
+            }
+        }
         String context = null;
         if (voiceProperties.isRagEnabled()) {
             context = vectorStoreService.buildRagContext(text, voiceProperties.getRagTopK());
             if (context != null && !context.isBlank()) {
-                systemContent = "参考以下知识库内容回答用户问题。如知识库无相关内容，可凭自身知识回答。\n\n【知识库】\n" + context;
+                systemParts.append("参考以下知识库内容回答用户问题。如知识库无相关内容，可凭自身知识回答。\n\n【知识库】\n").append(context);
             }
         }
+        String systemContent = systemParts.length() > 0 ? systemParts.toString() : "You are a helpful assistant.";
         var messages = java.util.List.of(
                 new ChatRequest.Message("system", systemContent),
                 new ChatRequest.Message("user", text)

@@ -41,6 +41,8 @@ public class VoicePipelineService {
     private final VectorStoreService vectorStoreService;
     private final DeviceControlService deviceControlService;
     private final ChatHistoryService chatHistoryService;
+    private final NmcWeatherService nmcWeatherService;
+    private final SinaStockService sinaStockService;
 
     /**
      * 执行完整管道，返回识别文字、回复文字、TTS 文件名（不含路径，用于拼 audioUrl）。
@@ -313,15 +315,30 @@ public class VoicePipelineService {
     }
 
     private List<ChatRequest.Message> buildMessagesWithRag(String userText) {
-        String systemPrompt;
+        StringBuilder systemParts = new StringBuilder();
+        if (props.isWeatherEnabled() && nmcWeatherService.isWeatherQuery(userText)) {
+            String weatherText = nmcWeatherService.fetchWeatherForQuery(userText);
+            if (weatherText != null && !weatherText.isBlank()) {
+                systemParts.append("【实时天气】（来源：中央气象台 nmc.cn）\n").append(weatherText).append("\n\n");
+                log.info("[管道] 注入天气数据: {}", weatherText.substring(0, Math.min(80, weatherText.length())) + "...");
+            }
+        }
+        if (props.isStockEnabled() && sinaStockService.isStockQuery(userText)) {
+            String stockText = sinaStockService.fetchStockForQuery(userText);
+            if (stockText != null && !stockText.isBlank()) {
+                systemParts.append("【实时行情】（来源：新浪财经）\n").append(stockText).append("\n\n");
+                log.info("[管道] 注入股票数据: {}", stockText.substring(0, Math.min(80, stockText.length())) + "...");
+            }
+        }
         if (props.isRagEnabled()) {
             String context = vectorStoreService.buildRagContext(userText, props.getRagTopK());
-            systemPrompt = (context != null && !context.isBlank())
-                    ? "严格根据以下【知识库】内容和用户问题作答：仅使用知识库中已有的信息，不要编造、不要猜测。若知识库中无与问题相关的内容，请明确回答「根据当前知识库暂无相关内容」或「不知道」，不要胡说八道。\n\n【知识库】\n" + context
-                    : "你是一个助手。若无法确定答案，请明确说不知道，不要编造。";
-        } else {
-            systemPrompt = "You are a helpful assistant.";
+            if (context != null && !context.isBlank()) {
+                systemParts.append("严格根据以下【知识库】内容和用户问题作答：仅使用知识库中已有的信息，不要编造、不要猜测。若知识库中无与问题相关的内容，请明确回答「根据当前知识库暂无相关内容」或「不知道」，不要胡说八道。\n\n【知识库】\n").append(context);
+            }
         }
+        String systemPrompt = systemParts.length() > 0
+                ? systemParts.toString() + "\n\n若无法确定答案，请明确说不知道，不要编造。"
+                : "You are a helpful assistant.";
         return List.of(
                 new ChatRequest.Message("system", systemPrompt),
                 new ChatRequest.Message("user", userText)

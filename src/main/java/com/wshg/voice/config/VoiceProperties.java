@@ -39,6 +39,12 @@ public class VoiceProperties {
     private boolean mock = false;
     private boolean ragEnabled = true;
     private int ragTopK = 5;
+    /** 是否启用天气查询（从中央气象台 nmc.cn 获取实时数据） */
+    private boolean weatherEnabled = true;
+    /** 用户问天气但未指定城市时使用的默认城市 */
+    private String weatherDefaultCity = "成都";
+    /** 是否启用股票查询（从新浪财经 hq.sinajs.cn 获取实时行情） */
+    private boolean stockEnabled = true;
     /** RAG 检索最低相似度（余弦），低于此值的文档不进入上下文，避免无关命中。建议 0.45~0.6 */
     private double ragMinScore = 0.5;
     private String vectorStoreType = "mysql";
@@ -72,6 +78,12 @@ public class VoiceProperties {
     public void setRagEnabled(boolean ragEnabled) { this.ragEnabled = ragEnabled; }
     public int getRagTopK() { return ragTopK; }
     public void setRagTopK(int ragTopK) { this.ragTopK = ragTopK; }
+    public boolean isWeatherEnabled() { return weatherEnabled; }
+    public void setWeatherEnabled(boolean weatherEnabled) { this.weatherEnabled = weatherEnabled; }
+    public String getWeatherDefaultCity() { return weatherDefaultCity; }
+    public void setWeatherDefaultCity(String weatherDefaultCity) { this.weatherDefaultCity = weatherDefaultCity; }
+    public boolean isStockEnabled() { return stockEnabled; }
+    public void setStockEnabled(boolean stockEnabled) { this.stockEnabled = stockEnabled; }
     public double getRagMinScore() { return ragMinScore; }
     public void setRagMinScore(double ragMinScore) { this.ragMinScore = ragMinScore; }
     public String getVectorStoreType() { return vectorStoreType; }
